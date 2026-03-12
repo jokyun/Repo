@@ -12,13 +12,13 @@ import ctypes.wintypes
 import threading
 
 # ── Windows 상수 ──────────────────────────────────────────────
-WM_POWERBROADCAST   = 0x0218
-PBT_APMSUSPEND      = 0x0004   # 절전/최대 절전 진입 직전 신호
-WS_EX_TOOLWINDOW    = 0x00000080
-WS_OVERLAPPED       = 0x00000000
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND    = 0x0004
+WS_EX_TOOLWINDOW  = 0x00000080
+WS_OVERLAPPED     = 0x00000000
 
 # ── 공유 플래그 ────────────────────────────────────────────────
-suspend_event = threading.Event()   # 절전 감지 시 set()
+suspend_event = threading.Event()
 
 # ── 마우스 제어 ────────────────────────────────────────────────
 class POINT(ctypes.Structure):
@@ -51,71 +51,105 @@ def restore_sleep():
     ES_CONTINUOUS = 0x80000000
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
-# ── 숨김 윈도우 + WM_POWERBROADCAST 감지 스레드 ───────────────
+# ── WM_POWERBROADCAST 감지용 숨김 창 스레드 ───────────────────
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_long,
+    ctypes.wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+)
+
 def _wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_POWERBROADCAST and wparam == PBT_APMSUSPEND:
-        timestamp = time.strftime("%H:%M:%S")
-        print(f"\n[{timestamp}] ⚡ 절전 모드 감지 → 프로그램을 종료합니다.")
+        print(f"\n[{time.strftime('%H:%M:%S')}] ⚡ 절전 모드 감지 → 프로그램을 종료합니다.")
         suspend_event.set()
     return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-def _run_message_loop():
-    """
-    메시지 전용 숨김 창을 생성해 WM_POWERBROADCAST 수신.
-    별도 스레드에서 실행된다.
-    """
-    WNDPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long,
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style",         ctypes.c_uint),
+        ("lpfnWndProc",   WNDPROC),
+        ("cbClsExtra",    ctypes.c_int),
+        ("cbWndExtra",    ctypes.c_int),
+        ("hInstance",     ctypes.wintypes.HINSTANCE),
+        ("hIcon",         ctypes.wintypes.HICON),
+        ("hCursor",       ctypes.wintypes.HANDLE),
+        ("hbrBackground", ctypes.wintypes.HBRUSH),
+        ("lpszMenuName",  ctypes.wintypes.LPCWSTR),
+        ("lpszClassName", ctypes.wintypes.LPCWSTR),
+    ]
+
+def _setup_win32_api():
+    """CreateWindowExW / RegisterClassW 에 명시적 argtypes 지정 (64비트 오버플로우 방지)"""
+    user32 = ctypes.windll.user32
+
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.RegisterClassW.restype  = ctypes.c_uint16
+
+    user32.CreateWindowExW.argtypes = [
+        ctypes.wintypes.DWORD,    # dwExStyle
+        ctypes.wintypes.LPCWSTR,  # lpClassName
+        ctypes.wintypes.LPCWSTR,  # lpWindowName
+        ctypes.wintypes.DWORD,    # dwStyle
+        ctypes.c_int,             # X
+        ctypes.c_int,             # Y
+        ctypes.c_int,             # nWidth
+        ctypes.c_int,             # nHeight
+        ctypes.wintypes.HWND,     # hWndParent
+        ctypes.wintypes.HMENU,    # hMenu
+        ctypes.wintypes.HINSTANCE,# hInstance
+        ctypes.wintypes.LPVOID,   # lpParam
+    ]
+    user32.CreateWindowExW.restype = ctypes.wintypes.HWND
+
+    user32.DefWindowProcW.argtypes = [
         ctypes.wintypes.HWND,
         ctypes.c_uint,
         ctypes.wintypes.WPARAM,
         ctypes.wintypes.LPARAM,
-    )
-    wnd_proc_cb = WNDPROC(_wnd_proc)
+    ]
+    user32.DefWindowProcW.restype = ctypes.c_long
 
+    user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(ctypes.wintypes.MSG),
+        ctypes.wintypes.HWND,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+    ]
+    user32.PeekMessageW.restype = ctypes.wintypes.BOOL
+
+def _run_message_loop():
+    _setup_win32_api()
+    user32    = ctypes.windll.user32
     hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
     class_name = "KeepAwakePowerWatcher"
 
-    class WNDCLASSW(ctypes.Structure):
-        _fields_ = [
-            ("style",         ctypes.c_uint),
-            ("lpfnWndProc",   WNDPROC),
-            ("cbClsExtra",    ctypes.c_int),
-            ("cbWndExtra",    ctypes.c_int),
-            ("hInstance",     ctypes.wintypes.HINSTANCE),
-            ("hIcon",         ctypes.wintypes.HICON),
-            ("hCursor",       ctypes.wintypes.HANDLE),
-            ("hbrBackground", ctypes.wintypes.HBRUSH),
-            ("lpszMenuName",  ctypes.wintypes.LPCWSTR),
-            ("lpszClassName", ctypes.wintypes.LPCWSTR),
-        ]
+    wnd_proc_cb = WNDPROC(_wnd_proc)   # 콜백을 변수로 유지 (GC 방지)
 
     wc = WNDCLASSW()
     wc.lpfnWndProc   = wnd_proc_cb
     wc.hInstance     = hInstance
     wc.lpszClassName = class_name
+    user32.RegisterClassW(ctypes.byref(wc))
 
-    ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
-
-    hwnd = ctypes.windll.user32.CreateWindowExW(
+    hwnd = user32.CreateWindowExW(
         WS_EX_TOOLWINDOW, class_name, "KeepAwake",
-        WS_OVERLAPPED, 0, 0, 0, 0,
+        WS_OVERLAPPED,
+        0, 0, 0, 0,
         None, None, hInstance, None,
     )
 
-    # 메시지 루프 (1초 단위로 suspend_event 확인하며 폴링)
     msg = ctypes.wintypes.MSG()
     while not suspend_event.is_set():
-        ret = ctypes.windll.user32.PeekMessageW(
-            ctypes.byref(msg), None, 0, 0, 1   # PM_REMOVE = 1
-        )
-        if ret:
-            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
-            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+        if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
         else:
             time.sleep(0.05)
 
-    ctypes.windll.user32.DestroyWindow(hwnd)
+    user32.DestroyWindow(hwnd)
 
 # ── 메인 ──────────────────────────────────────────────────────
 INTERVAL_MINUTES = 5
@@ -124,7 +158,6 @@ INTERVAL_SECONDS = INTERVAL_MINUTES * 60
 def main():
     prevent_sleep()
 
-    # 전원 이벤트 감시 스레드 시작
     watcher = threading.Thread(target=_run_message_loop, daemon=True)
     watcher.start()
 
@@ -140,11 +173,9 @@ def main():
             count += 1
             x, y = get_cursor_pos()
             nudge_mouse(offset=5)
-            timestamp = time.strftime("%H:%M:%S")
-            print(f"[{timestamp}] #{count:04d} 마우스 이동 완료 "
+            print(f"[{time.strftime('%H:%M:%S')}] #{count:04d} 마우스 이동 완료 "
                   f"(현재 위치: {x}, {y}) | 다음: {INTERVAL_MINUTES}분 후")
 
-            # INTERVAL_SECONDS 동안 1초 단위로 suspend_event 확인
             for _ in range(INTERVAL_SECONDS):
                 if suspend_event.is_set():
                     break
